@@ -6,7 +6,7 @@ from bson import json_util
 from bson.objectid import ObjectId
 from flask import Blueprint, jsonify, request
 from flask_cors import cross_origin
-from jwt import encode
+from jwt import encode, decode
 from marshmallow import Schema, fields, ValidationError
 from random import randint
 from email.mime.text import MIMEText
@@ -58,6 +58,25 @@ def test():
     output = {"msg": "I'm the test endpoint from blueprint_users"}
     return jsonify(output)
 
+# Endpoint to check login
+@blueprint_users.route('/login/<token>', methods=["GET"])
+@cross_origin()
+def check_login(token: str):
+    """
+    Method that checks whether current login is valid
+    """
+
+    try:
+        decoded_token = decode(token, Config.SECRET_KEY, algorithms=['HS256'])
+
+        if datetime.datetime.fromtimestamp(decoded_token["exp"]) > datetime.datetime.utcnow():
+            return jsonify({"result": True}), 201  # The token is still valid 
+        
+        return jsonify({"result": False}), 201
+    except Exception as err:
+        print(err)
+        return jsonify({"result": False, "err": f"An error occurred: {err}"}), 500
+
 # Endpoint to login
 @blueprint_users.route('/login', methods=['POST'])
 @cross_origin()
@@ -79,13 +98,7 @@ def login():
         token = encode({"user_id": user["hashID"], "role": user["role"], "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)}, Config.SECRET_KEY)
         collection.update_one({"email": body["email"]}, {"$set": {"active": True}})  # Set active flag
 
-        endpoint = Config.API_HOST + f"/users/{body['email']}/verification"
-        response = requests.get(endpoint)
-
         return jsonify({"token": token}), 201
-    
-    except smtplib.SMTPException as err:
-        return jsonify({"result": False, "err": f"An error occurred when sending the email: {err}"})
 
     except ValidationError as err:
         return jsonify({"result": False, "err": f"{err}"}), 401
@@ -211,6 +224,10 @@ def create_user():
         salt = bcrypt.gensalt()
         hashedPass = bcrypt.hashpw(body['password'].encode('utf-8'), salt)
         
+        # Generate token
+        token = encode({"user_id": abs(hash(body["email"])), "role": "user", "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)}, Config.SECRET_KEY)
+        collection.update_one({"email": body["email"]}, {"$set": {"active": True}})  # Set active flag
+
         collection.insert_one({
             "password": hashedPass,
             "email": body["email"],
@@ -219,7 +236,7 @@ def create_user():
             "role": "user"
         })
 
-        return jsonify({"result": True}), 201
+        return jsonify({"result": True, "token": token}), 201
 
     except ValidationError as err:
         return jsonify({"result": False, "err": f"{err}"}), 401
@@ -229,7 +246,6 @@ def create_user():
 # Endpoint to resolve 2FA
 @blueprint_users.route('/twofactor/<email>/<code>', methods=["GET"])
 @cross_origin()
-@AccessControl.token_required
 def resolve_twofactor(email: str, code: str):
     """
     Method that resolves a 2FA prompt, can only be called with valid API key
@@ -245,12 +261,16 @@ def resolve_twofactor(email: str, code: str):
         if not user:
             return jsonify({"err": "The user was not found!"}), 401
         
-        elif user["2fa"] != code:
+        elif user["authentication_code"] != code:
             return jsonify({"err": "The code is invalid, please try again!"}), 401
         
+        # Delete user's authentication code
+        collection.update_one({"email": email}, {"$unset": {"authentication_code": ""}}, False, True)
+
         return jsonify({"result": True}), 201
     
     except Exception as err:
+        print(err)
         return jsonify({"err": f"Internal Server Error: {err}"}), 500
 
 # Endpoint to make a user an administrator
